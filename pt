@@ -1,0 +1,221 @@
+#!/bin/bash
+# 一个健壮的脚本，用于管理媒体发布工具链（jietu, bdinfo, mkbrr等）及其依赖环境。
+# v31 - 优化Python环境处理逻辑，将python3和pip视为一个整体进行检测和安装。
+
+# 如果命令失败，立即退出。
+# 管道中任何一个命令失败，整个管道都算失败。
+set -o pipefail
+
+# --- 统一配置 ---
+LOG_FILE="/var/log/media_manager.log"
+DEBUG_LOG_FILE="/var/log/media_manager.debug.log"
+VERSION_DIR="/usr/local/etc/media_tool_versions"
+BDINFOCLI_INSTALL_DIR="/etc/abox/app/bdinfocli"
+BDINFOCLI_POSSIBLE_PATHS=("/etc/abox/app/bdinfocli" "/opt/bdinfocli")
+
+# --- 颜色与符号定义 ---
+readonly bold="\033[1m"; readonly blue="\033[34m"; readonly red="\033[31m"; readonly green="\033[32m"
+readonly yellow="\033[33m"; readonly dim="\033[2m"; readonly normal="\033[0m"
+readonly I_INFO="i"; readonly I_OK="✓"; readonly I_WARN="!"; readonly I_ERR="✗"; readonly I_STEP="→"
+
+# --- 全局变量 ---
+OS=""; OS_ID=""; PIP_COMMAND=""
+
+# --- 消息与日志函数 ---
+log() { run_as_user tee -a "$LOG_FILE" >/dev/null <<< "[$1] $(date '+%Y-%m-%d %H:%M:%S') - $2"; }
+print_header() { local msg="$1"; echo -e "\n${bold}${blue}--- ${msg} ---${normal}"; }
+msg_step() { echo -e "  ${dim}${I_STEP}${normal} $1"; log "STEP" "$1"; }
+msg_info() { echo -e "  ${blue}${I_INFO}${normal} $1"; log "INFO" "$1"; }
+msg_ok()   { echo -e "  ${green}${I_OK}${normal} $1"; log "OK" "$1"; }
+msg_err()  { echo -e "  ${red}${I_ERR}${normal} $1"; log "ERROR" "$1"; }
+msg_warn() { echo -e "  ${yellow}${I_WARN}${normal} $1"; log "WARN" "$1"; }
+spinner() {
+    local pid=$1; local delay=0.1; local spinstr='|/-\'
+    while ps -p "$pid" > /dev/null; do
+        local temp=${spinstr#?}; printf " [%c]  " "$spinstr"; local spinstr=$temp${spinstr%"$temp"}; sleep $delay; printf "\b\b\b\b\b\b"
+    done; printf "      \b\b\b\b\b\b"
+}
+
+# --- 核心函数 ---
+run_as_user() { if [[ $EUID -eq 0 ]]; then "$@"; else sudo "$@"; fi; }
+run_cmd() {
+    local cmd_str="$*"; msg_step "执行命令: ${dim}${cmd_str}${normal}"; local output_file; output_file=$(mktemp)
+    (run_as_user "$@" >> "$output_file" 2>&1) & local cmd_pid=$!; spinner $cmd_pid; wait $cmd_pid; local exit_code=$?
+    run_as_user tee -a "$DEBUG_LOG_FILE" < "$output_file" >/dev/null
+    if [ $exit_code -eq 0 ]; then
+        msg_ok "命令成功执行。"; rm -f "$output_file"; return 0
+    else
+        msg_err "命令执行失败 (退出码: $exit_code)。详情请查看调试日志: $DEBUG_LOG_FILE"
+        echo -e "${dim}--- 错误输出 ---\n$(cat "$output_file")\n--- 结束 ---${normal}" >&2; rm -f "$output_file"; return "$exit_code"
+    fi
+}
+# --- 帮助函数 ---
+show_help() {
+    echo -e "${bold}媒体发布工具链管理器 (v31)${normal}"; echo -e "一个用于安装、更新和管理媒体发布工具 (jietu, bdinfo, mkbrr) 及其依赖的脚本。"
+    echo -e "特性: 自动安装所有依赖, 智能版本管理, 专业级UI和日志系统。"; echo
+    echo -e "${bold}${blue}用法:${normal}"; echo -e "  $0 [管理命令]"; echo -e "  $0 [工具名] [工具参数...]"; echo -e "  $0                  (进入交互式环境管理菜单)"; echo
+    echo -e "${bold}${blue}管理命令:${normal}"
+    echo -e "  ${yellow}--install${normal}                 安装或修复所有工具及其依赖。"
+    echo -e "  ${yellow}--check${normal}                   检测所有工具和依赖的状态。"
+    echo -e "  ${yellow}--update${normal}                  检查并更新所有可更新的组件。"
+    echo -e "  ${yellow}--uninstall${normal}               卸载所有工具和依赖。"
+    echo -e "  ${yellow}--help, -h${normal}                  显示此帮助信息并退出。"
+}
+# --- 环境管理与检测 ---
+detect_os() { if [[ -n "$OS_ID" ]]; then return 0; fi; if [[ -f /etc/os-release ]]; then . /etc/os-release; OS=$NAME; OS_ID=$ID; elif type lsb_release >/dev/null 2>&1; then OS=$(lsb_release -si); OS_ID=$(lsb_release -si | tr '[:upper:]' '[:lower:]'); else msg_err "无法检测操作系统。"; return 1; fi; }
+detect_pip_command() { PIP_COMMAND=""; if command -v pip3 &>/dev/null; then PIP_COMMAND="pip3"; elif command -v pip &>/dev/null; then if pip --version 2>/dev/null | grep -q 'python 3'; then PIP_COMMAND="pip"; fi; fi; }
+ensure_command() {
+    local cmd_name="$1"; local pkg_name="${2:-$cmd_name}"; local arch_pkg_name="${3:-$pkg_name}"; local target_pkg_name=$pkg_name; [[ "$OS_ID" == "arch" ]] && target_pkg_name=$arch_pkg_name
+    if command -v "$cmd_name" &>/dev/null; then msg_ok "命令 '$cmd_name' 已存在。"; return 0; fi; msg_warn "命令 '$cmd_name' 未找到，尝试安装软件包 '$target_pkg_name'..."
+    case "$OS_ID" in debian|ubuntu) run_cmd apt-get install -y "$pkg_name";; centos|fedora|rhel) if command -v dnf &>/dev/null; then run_cmd dnf install -y "$pkg_name"; else run_cmd yum install -y "$pkg_name"; fi;; arch) run_cmd pacman -S --noconfirm "$target_pkg_name";; *) msg_err "无法为未知系统 '$OS_ID' 自动安装 '$target_pkg_name'。"; return 1;; esac
+    if ! command -v "$cmd_name" &>/dev/null; then msg_err "安装 '$target_pkg_name' 后，命令 '$cmd_name' 仍然不可用。"; return 1; fi
+}
+get_status_line() { local name="$1"; local status="$2"; printf "  %-22s: %b\n" "$name" "$status"; }
+
+ensure_python_env() {
+    print_header "检查并安装 Python 环境"
+    detect_pip_command
+    if command -v python3 &>/dev/null && [[ -n "$PIP_COMMAND" ]]; then
+        msg_ok "Python 3 和 Pip 环境已完整。"
+        return 0
+    fi
+
+    msg_warn "Python 环境不完整，正在尝试安装/修复..."
+    local python_pkg="python3"
+    local pip_pkg="python3-pip"
+    if [[ "$OS_ID" == "arch" ]]; then
+        python_pkg="python"
+        pip_pkg="python-pip"
+    fi
+
+    # 一次性安装python和pip，让包管理器处理依赖
+    if ! run_cmd apt-get install -y "$python_pkg" "$pip_pkg" 2>/dev/null || ! run_cmd dnf install -y "$python_pkg" "$pip_pkg" 2>/dev/null || ! run_cmd pacman -S --noconfirm "$python_pkg" "$pip_pkg" 2>/dev/null; then
+        # 兼容旧系统或分离包的情况
+        ensure_command "python3" "$python_pkg"
+        ensure_command "pip3" "$pip_pkg"
+    fi
+
+    detect_pip_command
+    if ! command -v python3 &>/dev/null || [[ -z "$PIP_COMMAND" ]]; then
+        msg_err "Python 环境安装失败。"
+        return 1
+    fi
+    msg_ok "Python 环境安装成功。"
+}
+
+install_tool_script() {
+    local tool_name="$1"; local repo_owner="2898531823"; local repo_name="seedbox-info"; local branch="master"; local script_path="script"
+    print_header "安装/更新 $tool_name 工具"; if ! ensure_command "wget"; then return 1; fi
+    local url="https://raw.githubusercontent.com/${repo_owner}/${repo_name}/${branch}/${script_path}/${tool_name}"; local dest="/usr/local/bin/${tool_name}"
+    msg_step "从您的仓库下载: $url"; if ! run_cmd wget -q "$url" -O "$dest"; then msg_err "$tool_name 下载失败。"; return 1; fi
+    msg_step "授予执行权限..."; run_cmd chmod +x "$dest"; msg_ok "$tool_name 已安装到 $dest"
+}
+install_mkbrr() {
+    print_header "安装/更新 mkbrr"; if ! ensure_command "wget" || ! ensure_command "tar" || ! ensure_command "curl" || ! ensure_command "jq"; then msg_err "安装 mkbrr 需要 wget, tar, curl 和 jq 命令。"; return 1; fi
+    msg_step "从 GitHub API 获取最新版本信息..."; local api_url="https://api.github.com/repos/autobrr/mkbrr/releases/latest"; local api_response; api_response=$(curl -s "$api_url")
+    if [[ -z "$api_response" ]]; then msg_err "无法连接到 GitHub API。"; return 1; fi
+    local latest_version; latest_version=$(echo "$api_response" | jq -r '.tag_name'); local download_url; download_url=$(echo "$api_response" | jq -r '.assets[] | select(.name | contains("linux_x86_64.tar.gz")) | .browser_download_url')
+    if [[ -z "$latest_version" || "$latest_version" == "null" || -z "$download_url" || "$download_url" == "null" ]]; then msg_err "无法从 GitHub API 解析最新版本或下载链接。"; return 1; fi
+    msg_ok "最新版本为: ${yellow}$latest_version${normal}"; local temp_dir; temp_dir=$(mktemp -d); trap 'rm -rf "$temp_dir"' RETURN
+    msg_step "下载 mkbrr ($latest_version)..."; if ! wget -qO "$temp_dir/mkbrr.tar.gz" "$download_url"; then msg_err "下载 mkbrr 失败。"; return 1; fi
+    msg_step "解压文件..."; if ! tar -xzf "$temp_dir/mkbrr.tar.gz" -C "$temp_dir"; then msg_err "解压 mkbrr 失败。"; return 1; fi
+    msg_step "移动到 /usr/local/bin/ 并设置权限..."; if ! run_cmd mv "$temp_dir/mkbrr" /usr/local/bin/mkbrr; then return 1; fi; run_cmd chmod +x /usr/local/bin/mkbrr
+    run_as_user mkdir -p "$VERSION_DIR"; echo "$latest_version" | run_as_user tee "$VERSION_DIR/mkbrr.version" > /dev/null; msg_ok "mkbrr 安装/更新完成。"
+}
+install_nconvert() {
+    print_header "安装 nconvert"; if command -v nconvert &>/dev/null; then msg_ok "nconvert 已安装。"; return 0; fi
+    if ! ensure_command "wget" || ! ensure_command "tar"; then msg_err "安装 nconvert 需要 wget 和 tar 命令。"; return 1; fi
+    local temp_dir; temp_dir=$(mktemp -d); trap 'rm -rf "$temp_dir"' RETURN
+    msg_step "下载 NConvert..."; if ! wget -qO "$temp_dir/NConvert-linux64.tgz" https://download.xnview.com/NConvert-linux64.tgz; then msg_err "下载 nconvert 失败。"; return 1; fi
+    msg_step "解压文件..."; if ! tar -xzf "$temp_dir/NConvert-linux64.tgz" --strip-components=1 -C "$temp_dir"; then msg_err "解压 nconvert 失败。"; return 1; fi
+    msg_step "移动到 /usr/local/bin/ 并设置权限..."; if ! run_cmd mv "$temp_dir/nconvert" /usr/local/bin/nconvert; then return 1; fi; run_cmd chmod +x /usr/local/bin/nconvert
+    run_as_user mkdir -p "$VERSION_DIR"; echo "n/a" | run_as_user tee "$VERSION_DIR/nconvert.version" > /dev/null
+}
+install_all_dependencies() {
+    print_header "安装所有依赖环境"; detect_os
+    ensure_command "curl"; ensure_command "jq"; ensure_command "wget"; ensure_command "tar"; ensure_command "mediainfo"; ensure_command "ffmpeg"; ensure_command "bc" "bc"; ensure_command "numfmt" "coreutils"; ensure_command "mono" "mono-complete"; ensure_command "git"
+    ensure_python_env
+    if [[ -n "$PIP_COMMAND" ]]; then msg_step "安装/更新 Python 包..."; run_cmd "$PIP_COMMAND" install -U imgbox-cli ptpimg-uploader --break-system-packages; fi
+}
+install_all_tools() {
+    print_header "安装所有工具脚本"; install_tool_script "jietu"; install_tool_script "bdinfo"; install_mkbrr; install_nconvert
+}
+install_all_environments() {
+    print_header "一键安装/修复所有环境与工具"; install_all_dependencies; install_all_tools; msg_ok "所有环境和工具的安装/修复流程已完成。"
+}
+check_environment_status() {
+    print_header "环境状态检测"; detect_os; detect_pip_command; local all_ok=1
+    echo -e "${bold}  🛠️ 工具脚本:${normal}"
+    command -v jietu &>/dev/null && get_status_line "jietu" "${green}${I_OK} 已安装${normal}" || { get_status_line "jietu" "${red}${I_ERR} 未安装${normal}"; all_ok=0; }
+    command -v bdinfo &>/dev/null && get_status_line "bdinfo" "${green}${I_OK} 已安装${normal}" || { get_status_line "bdinfo" "${red}${I_ERR} 未安装${normal}"; all_ok=0; }
+    if command -v mkbrr &>/dev/null; then local ver_info=""; if [[ -f "$VERSION_DIR/mkbrr.version" ]]; then ver_info=" ($(run_as_user cat "$VERSION_DIR/mkbrr.version"))"; fi; get_status_line "mkbrr" "${green}${I_OK} 已安装${ver_info}${normal}"; else get_status_line "mkbrr" "${red}${I_ERR} 未安装${normal}"; all_ok=0; fi
+    command -v nconvert &>/dev/null && get_status_line "nconvert" "${green}${I_OK} 已安装${normal}" || { get_status_line "nconvert" "${red}${I_ERR} 未安装${normal}"; all_ok=0; }
+
+    echo -e "\n${bold}  ⚙️ 依赖环境:${normal}"
+    if command -v python3 &>/dev/null && [[ -n "$PIP_COMMAND" ]]; then get_status_line "Python Env" "${green}${I_OK} 已完整 ($(python3 -V 2>&1), $PIP_COMMAND)${normal}"; else
+        local py_status; py_status=$(command -v python3 &>/dev/null && echo "有python3" || echo "无python3")
+        local pip_status; pip_status=$([[ -n "$PIP_COMMAND" ]] && echo "有pip" || echo "无pip")
+        get_status_line "Python Env" "${red}${I_ERR} 未完整 ($py_status, $pip_status)${normal}"; all_ok=0
+    fi
+    # ... 其他依赖检测
+    command -v mediainfo &>/dev/null && get_status_line "mediainfo" "${green}${I_OK} 已安装${normal}" || { get_status_line "mediainfo" "${red}${I_ERR} 未安装${normal}"; all_ok=0; }
+
+    echo; if [[ $all_ok -eq 1 ]]; then msg_ok "所有工具和依赖均已正确安装。"; else msg_warn "环境不完整！请进入菜单选择 '安装/修复环境'。"; fi
+}
+uninstall_all() {
+    print_header "环境与工具卸载"; detect_os; detect_pip_command
+    msg_step "卸载工具脚本..."; run_cmd rm -f /usr/local/bin/jietu /usr/local/bin/bdinfo /usr/local/bin/mkbrr /usr/local/bin/nconvert
+    msg_step "卸载Python包..."; if [[ -n "$PIP_COMMAND" ]]; then run_cmd "$PIP_COMMAND" uninstall -y imgbox-cli ptpimg-uploader; fi
+    msg_step "卸载系统依赖包..."; case "$OS_ID" in
+        debian|ubuntu) run_cmd apt purge -y curl jq mediainfo ffmpeg mono-complete python3 python3-pip git bc coreutils; run_cmd apt autoremove -y;;
+        #...
+    esac
+    msg_step "清理版本和配置目录..."; run_cmd rm -rf "$VERSION_DIR" "$BDINFOCLI_INSTALL_DIR"
+    msg_ok "卸载完成。"
+}
+# --- 主程序 ---
+main() {
+    # 命令行直接调用模式
+    if [[ $# -gt 0 ]]; then
+        case "$1" in
+            --install) install_all_environments; exit $?;;
+            --check) check_environment_status; exit $?;;
+            --update) msg_err "此命令已弃用，请使用 --install 更新所有工具至最新版。"; exit 1;;
+            --uninstall) uninstall_all; exit $?;;
+            --help|-h) show_help; exit 0;;
+            *)
+                if command -v "$1" &>/dev/null; then
+                    msg_info "检测到工具命令 '$1'，将直接调用它..."
+                    local tool_to_run="$1"; shift
+                    "$tool_to_run" "$@"
+                    exit $?
+                else
+                    msg_err "未知管理器命令或系统命令: '$1'"; show_help; exit 1
+                fi
+                ;;
+        esac
+    fi
+
+    # 交互菜单模式
+    run_as_user touch "$LOG_FILE" &>/dev/null; run_as_user touch "$DEBUG_LOG_FILE" &>/dev/null
+
+    while true; do
+        clear; print_header "媒体工具链管理器 (交互模式)"
+        echo " 1. 检测环境与工具"
+        echo " 2. 安装/修复所有环境与工具"
+        echo " 3. 卸载所有环境与工具"
+        echo " 0. 退出脚本"
+        echo -e "----------------------------------------"
+        echo -e "${dim}提示: 使用 --help 查看所有命令行功能。${normal}"
+        read -p "请输入选项 (0-3): " CHOICE
+        case "$CHOICE" in
+            1) check_environment_status; read -p "按任意键继续...";;
+            2) install_all_environments; read -p "按任意键继续...";;
+            3) read -p "⚠️ 确认卸载所有相关环境和工具? (y/n): " CONFIRM; if [[ "$CONFIRM" =~ ^[yY]$ ]]; then uninstall_all; else msg_info "操作已取消。"; fi; read -p "按任意键继续...";;
+            0) echo "👋 正在退出程序。"; exit 0;;
+            *) msg_err "无效选项"; sleep 1;;
+        esac
+    done
+}
+
+main "$@"
